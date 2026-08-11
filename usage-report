@@ -16,29 +16,40 @@ Reads Loki's api_request events, so every figure is a sum of real per-request
 values rather than a counter approximation.
 """
 import argparse
+import calendar
 import json
+import os
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-LOKI = "http://localhost:3100"
+LOKI = os.environ.get("CLAUDE_TELEMETRY_LOKI", "http://localhost:3100")
+
+# Loki refuses limit > max_entries_limit_per_query (5000 by default), and
+# truncates silently at whatever limit you do pass. See query().
+PAGE = 5000
+
+# Colour only when writing to a terminal, so piping to a file or grep stays clean.
+if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+    DIM, RESET, BOLD, RED = "\033[2m", "\033[0m", "\033[1m", "\033[31m"
+else:
+    DIM = RESET = BOLD = RED = ""
 
 
 def parse_since(s):
     units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
     try:
-        if s[-1] in units:
-            return float(s[:-1]) * units[s[-1]]
-        return float(s) * 3600
+        v = float(s[:-1]) * units[s[-1]] if s and s[-1] in units else float(s) * 3600
     except (ValueError, IndexError):
         sys.exit(f"bad --since value: {s!r} (try 30m, 24h, 7d)")
+    if v <= 0:
+        sys.exit(f"--since must be positive, got {s!r}")
+    return v
 
 
-def query(logql, since_s, limit=5000):
-    end = time.time()
-    start = end - since_s
+def _get(logql, start, end, limit):
     url = LOKI + "/loki/api/v1/query_range?" + urllib.parse.urlencode(
         {"query": logql, "limit": str(limit),
          "start": str(int(start * 1e9)), "end": str(int(end * 1e9))}
@@ -46,11 +57,15 @@ def query(logql, since_s, limit=5000):
     try:
         with urllib.request.urlopen(url, timeout=30) as r:
             data = json.load(r)["data"]["result"]
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Loki rejected the query ({e.code}): {e.read().decode()[:200]}")
     except urllib.error.URLError as e:
-        sys.exit(f"cannot reach Loki at {LOKI} — is the stack running?\n  docker compose up -d\n  ({e})")
+        sys.exit(f"cannot reach Loki at {LOKI} — is the stack running?\n"
+                 f"  docker compose up -d\n  ({e})")
 
-    # One record per log line, not per stream: identical-looking events share a
-    # stream, so taking stream labels alone silently drops repeats.
+    # One record per log line, not per stream: events sharing a label set arrive
+    # as multiple values under one stream, so reading stream labels alone would
+    # silently drop the repeats.
     out = []
     for st in data:
         labels = st.get("stream", {})
@@ -63,22 +78,81 @@ def query(logql, since_s, limit=5000):
     return out
 
 
+def _key(r):
+    return (r.get("_ts"), r.get("session_id"), r.get("event_name"),
+            r.get("event_sequence"), r.get("request_id"))
+
+
+def query(logql, since_s):
+    """Fetch every matching event, working around Loki's hard 5000-entry cap.
+
+    Loki truncates at the limit without saying so, which would make this tool
+    under-report costs while looking authoritative. When a window comes back
+    full we split it in half and fetch each side, recursing until every window
+    is under the cap.
+    """
+    end = time.time()
+    seen, out, truncated = set(), [], False
+
+    def walk(a, b, depth):
+        nonlocal truncated
+        recs = _get(logql, a, b, PAGE)
+        if len(recs) < PAGE:
+            for r in recs:
+                k = _key(r)
+                if k not in seen:
+                    seen.add(k)
+                    out.append(r)
+            return
+        if depth >= 24 or (b - a) < 2:
+            # Only reachable if a single 2-second window holds PAGE+ events,
+            # which one user cannot produce.
+            truncated = True
+            for r in recs:
+                k = _key(r)
+                if k not in seen:
+                    seen.add(k)
+                    out.append(r)
+            return
+        mid = (a + b) / 2
+        walk(a, mid, depth + 1)
+        walk(mid, b, depth + 1)
+
+    walk(end - since_s, end, 0)
+    if truncated:
+        print(f"  {RED}warning: hit Loki's entry cap; some events are missing "
+              f"and totals below are underestimates{RESET}", file=sys.stderr)
+    return out
+
+
 def in_order(evs):
     """Chronological order.
 
-    event_sequence is Claude Code's own monotonic counter and is authoritative —
-    ingest timestamps can transpose events emitted in the same instant. Fall back
-    to ingest time only if any record lacks a sequence number.
+    Sorts on event_timestamp (millisecond precision, set by Claude Code when the
+    event happens) rather than Loki's ingest time, which can transpose events
+    written in the same batch. event_sequence breaks ties within a millisecond.
     """
     return sorted(evs, key=lambda s: (s.get("event_timestamp", ""),
                                       int(f(s, "event_sequence")),
                                       s.get("_ts", 0)))
 
 
+def hhmmss(ts):
+    """UTC ISO timestamp from Claude Code -> local wall-clock HH:MM:SS."""
+    if not ts:
+        return "--:--:--"
+    try:
+        return time.strftime("%H:%M:%S",
+                             time.localtime(calendar.timegm(
+                                 time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))))
+    except (ValueError, OverflowError):
+        return ts[11:19]
+
+
 def f(s, key, default=0):
     try:
         return float(s.get(key, default) or default)
-    except ValueError:
+    except (ValueError, TypeError):
         return default
 
 
@@ -91,7 +165,7 @@ def money(v):
 
 
 def bar(frac, width=24):
-    n = int(round(frac * width))
+    n = max(0, min(width, int(round(frac * width))))
     return "█" * n + "·" * (width - n)
 
 
@@ -167,7 +241,7 @@ def sessions(reqs):
         lab = sess_label(d["r"])
         dim = "" if (d["r"].get("project") or d["r"].get("dir")) else DIM
         print(f"  {dim}{sid[:8]:<9} {lab:<20} {d['n']:>4} {money(d['c']):>10} "
-              f"{d['o']:>8,}  {d['t'][11:19]}{RESET}")
+              f"{d['o']:>8,}  {hhmmss(d['t'])}{RESET}")
     print(f"  {'─' * 78}")
     print(f"  {DIM}drill in:  ./usage-report -m --session <id-or-project>{RESET}")
     if untagged:
@@ -175,7 +249,7 @@ def sessions(reqs):
               f" by directory{RESET}")
 
 
-def group(reqs, key, title, name_fn=None):
+def group(reqs, key, title):
     if not reqs:
         print("no requests in range.")
         return
@@ -191,9 +265,9 @@ def group(reqs, key, title, name_fn=None):
     print(f"\n  {title}  ({len(agg)} total, {money(total)})")
     print(f"  {'─' * 66}")
     for k, d in sorted(agg.items(), key=lambda x: -x[1][1]):
-        label = name_fn(k) if name_fn else k[:8]
+        label = k[:8]
         share = d[1] / total if total else 0
-        print(f"  {label:<10} {d[0]:>4} req  {money(d[1]):>11}  {d[2]:>7,} out  {bar(share, 16)} {d[3][11:19]}")
+        print(f"  {label:<10} {d[0]:>4} req  {money(d[1]):>11}  {d[2]:>7,} out  {bar(share, 16)} {hhmmss(d[3])}")
 
 
 def top(reqs, n):
@@ -201,7 +275,7 @@ def top(reqs, n):
     print(f"  {'─' * 78}")
     print(f"  {'cost':>10}  {'time':<9} {'model':<26} {'cacheCreate':>12} {'cacheRead':>11}  {'dur':>7}")
     for s in sorted(reqs, key=lambda s: -f(s, "cost_usd"))[:n]:
-        print(f"  {money(f(s, 'cost_usd')):>10}  {s.get('event_timestamp','')[11:19]:<9} "
+        print(f"  {money(f(s, 'cost_usd')):>10}  {hhmmss(s.get('event_timestamp','')):<9} "
               f"{s.get('model','?'):<26} {i(s,'cache_creation_tokens'):>12,} "
               f"{i(s,'cache_read_tokens'):>11,}  {f(s,'duration_ms')/1000:>6.1f}s")
 
@@ -233,10 +307,14 @@ def messages(since_s, want_session=None):
         sid = max(evs, key=lambda s: s.get("event_timestamp", "")).get("session_id", "")
 
     evs = [s for s in evs if s.get("session_id") == sid]
-    prompts, calls = {}, {}
+    prompts, calls, orphan = {}, {}, []
     for s in evs:
         pid = s.get("prompt_id")
         if not pid:
+            # An api_request with no prompt_id belongs to no message. Keep its
+            # cost visible rather than silently dropping it from the total.
+            if s.get("event_name") == "api_request":
+                orphan.append(s)
             continue
         if s.get("event_name") == "user_prompt":
             prompts[pid] = s
@@ -265,25 +343,26 @@ def messages(since_s, want_session=None):
         cum += cost
         out = sum(i(c, "output_tokens") for c in cs)
         if p is None:
-            text = "\033[2m(background / subagent work)\033[0m"
+            text = f"{DIM}(background / subagent work){RESET}"
         else:
             raw = str(p.get("prompt", ""))
             if raw in ("<REDACTED>", "None", ""):
-                text = f"\033[2m<redacted, {p.get('prompt_length','?')} chars>\033[0m"
+                text = f"{DIM}<redacted, {p.get('prompt_length','?')} chars>{RESET}"
             else:
                 text = raw.replace("\n", " ")[:46]
-        print(f"  {ts[11:19]:<9} {DIM}{pid[:8]}{RESET}  {money(cost):>9} {money(cum):>9} "
+        print(f"  {hhmmss(ts):<9} {DIM}{pid[:8]}{RESET}  {money(cost):>9} {money(cum):>9} "
               f"{len(cs):>4} {out:>7,}  {text}")
 
     print(f"  {'─' * 96}")
+    if orphan:
+        oc = sum(f(s, "cost_usd") for s in orphan)
+        print(f"  {DIM}+ {len(orphan)} API call(s) with no parent message: "
+              f"{money(oc)}  (session total {money(total + oc)}){RESET}")
     if rows:
         dear = max(rows, key=lambda r: sum(f(c, "cost_usd") for c in r[3]))
-        print(f"  priciest: {money(sum(f(c,'cost_usd') for c in dear[3]))} at {dear[0][11:19]}")
+        print(f"  priciest: {money(sum(f(c,'cost_usd') for c in dear[3]))} at {hhmmss(dear[0])}")
         print(f"  {DIM}drill into any row:  ./usage-report --prompt <id>"
               f"   (e.g. {dear[1][:8]}){RESET}")
-
-
-DIM, RESET, BOLD = "\033[2m", "\033[0m", "\033[1m"
 
 
 def tool_gist(s):
@@ -353,7 +432,7 @@ def timeline(pid, since_s):
     step = 0
     for s in evs:
         n = s.get("event_name", "?")
-        t = s.get("event_timestamp", "")[11:19]
+        t = hhmmss(s.get("event_timestamp", ""))
         if n in ("user_prompt", "tool_result"):
             continue
         if n == "api_request":
@@ -372,12 +451,12 @@ def timeline(pid, since_s):
             elif res.get("success") == "true":
                 outcome = f"{DIM}{f(res,'duration_ms')/1000:.1f}s → {i(res,'tool_result_size_bytes'):,}B{RESET}"
             else:
-                outcome = f"\033[31mFAILED\033[0m {DIM}{f(res,'duration_ms')/1000:.1f}s{RESET}"
+                outcome = f"{RED}FAILED{RESET} {DIM}{f(res,'duration_ms')/1000:.1f}s{RESET}"
             mark = "✓" if d == "accept" else "✗"
-            gist = tool_gist(res) if res is not None and tool_gist(res) else tool_gist(s)
+            gist = (res is not None and tool_gist(res)) or tool_gist(s)
             print(f"      {t}  {mark} {s.get('tool_name','?'):<10} {outcome:<34} {gist}")
         elif n in ("api_error", "api_refusal", "internal_error"):
-            print(f"      {t}  \033[31m{n}{RESET}")
+            print(f"      {t}  {RED}{n}{RESET}")
 
     print(f"  {'─' * 86}")
     if calls:
@@ -439,8 +518,8 @@ def main():
         sessions(reqs)
     elif a.prompts:
         group(reqs, "prompt_id", "cost by prompt (one thing you typed)")
-    elif a.top:
-        top(reqs, a.top)
+    elif a.top is not None:
+        top(reqs, max(1, a.top))
     else:
         summary(reqs, f"last {a.since}")
     print()

@@ -95,7 +95,10 @@ metadata only.
 Arguments pass through to `claude`, so `./claude-verbose --tools -p "..."` works.
 
 It prints a warning banner naming the level before launching, and tags every event with
-`content_logging=<level>` so verbose sessions are easy to find later.
+`content_logging=<level>` so verbose sessions are easy to find later. It also applies the
+`project` / `dir` tags itself — the `tag-sessions.sh` shell function can't reach a script, since
+shell functions aren't inherited by child processes, so without this a verbose session would show
+up untagged in `--sessions`.
 
 ### What each level actually captures
 

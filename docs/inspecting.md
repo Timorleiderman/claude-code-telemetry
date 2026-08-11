@@ -200,6 +200,22 @@ To trace one prompt, copy its `prompt_id` from an expanded row into **Explore â†
 {service_name="claude-code"} | prompt_id="9r0m9703-..."
 ```
 
+## Notes on the tool itself
+
+**Times are your local wall clock.** Claude Code emits UTC; `usage-report` converts. If you compare
+against raw Loki or Grafana output, those show UTC and will look offset.
+
+**Large ranges are safe.** Loki caps any single query at 5000 entries and truncates *silently* â€”
+which would make a `--since 30d` report quietly under-count. `usage-report` splits the range and
+recurses until every window fits, so totals stay complete. If it ever can't (a single 2-second
+window with 5000+ events, which one person cannot generate) it prints a warning to stderr rather
+than reporting a wrong number quietly.
+
+**Piping is clean.** Colour is suppressed when stdout isn't a terminal, so
+`./usage-report -m > report.txt` and `| grep` behave. `NO_COLOR=1` forces it off too.
+
+**Pointing elsewhere.** `CLAUDE_TELEMETRY_LOKI=http://host:3100 ./usage-report` if you moved Loki.
+
 ## Ad-hoc questions
 
 When the script doesn't cover it, [Query recipes](queries.md) has the copy-paste set. The two

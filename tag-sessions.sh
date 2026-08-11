@@ -11,6 +11,9 @@
 # Claude Code has no built-in workspace attribute, so this is the only way to
 # know which session was which. Set OTEL_RESOURCE_ATTRIBUTES yourself before
 # launching to override the automatic tag.
+#
+# This only affects sessions started as `claude`. Shell functions are not
+# inherited by scripts, so ./claude-verbose applies the same tags itself.
 
 claude() {
   local auto="project=${PWD##*/},dir=${PWD}"

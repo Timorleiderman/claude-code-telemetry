@@ -138,6 +138,19 @@ curl -s http://localhost:3100/loki/api/v1/labels | python3 -m json.tool
 
 Expect five: `event_name`, `host_name`, `os_type`, `service_name`, `service_version`.
 
+## "warning: hit Loki's entry cap"
+
+`usage-report` prints this when it cannot guarantee a complete result. Loki refuses more than 5000
+entries per query and truncates without error, so the tool splits the time range and recurses until
+each window fits. The warning means even a 2-second window held 5000+ events — effectively
+impossible for a single user, so treat it as a sign something is republishing events. The totals
+shown are underestimates.
+
+## Times don't match Grafana
+
+`usage-report` converts to your local timezone; Grafana and raw Loki responses show UTC. Same
+events, different presentation.
+
 ## Grafana shows "datasource not found"
 
 Provisioning runs at startup and the datasource UIDs (`prometheus`, `loki`) are referenced by the
