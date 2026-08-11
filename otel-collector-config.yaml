@@ -1,0 +1,49 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+  # Claude Code defaults to delta temporality; Prometheus wants cumulative.
+  # We also pin the client to cumulative in claude-telemetry.env, but this
+  # makes the collector correct either way.
+  delta_to_cumulative:
+
+exporters:
+  # Scraped by Prometheus at otel-collector:8889/metrics
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Note: the exporter appends the OTel unit to the metric name, so
+    # claude_code.token.usage (unit: tokens) is scraped as
+    # claude_code_token_usage_tokens_total. See docs/metrics.md for the
+    # full list of real, verified names.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Events (user_prompt, tool_result, api_request, ...) go to Loki over OTLP.
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+
+  # Uncomment in the pipelines below to eyeball raw payloads:
+  #   docker compose logs -f otel-collector
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [delta_to_cumulative, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_http/loki]

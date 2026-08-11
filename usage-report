@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""
+Claude Code usage report — cost, tokens and latency, straight from the local stack.
+
+  ./usage-report                    last 24h summary
+  ./usage-report -m                 THIS session, cost of every message
+  ./usage-report -m --session 04fd   a specific session
+  ./usage-report --since 7d         last 7 days
+  ./usage-report --sessions         break down by session
+  ./usage-report --prompts          break down by prompt (what each thing you typed cost)
+  ./usage-report --top 10           most expensive individual requests
+  ./usage-report --prompt <id>      full timeline for one prompt
+  ./usage-report --watch            live totals, refreshed every 10s
+
+Reads Loki's api_request events, so every figure is a sum of real per-request
+values rather than a counter approximation.
+"""
+import argparse
+import json
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+LOKI = "http://localhost:3100"
+
+
+def parse_since(s):
+    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    try:
+        if s[-1] in units:
+            return float(s[:-1]) * units[s[-1]]
+        return float(s) * 3600
+    except (ValueError, IndexError):
+        sys.exit(f"bad --since value: {s!r} (try 30m, 24h, 7d)")
+
+
+def query(logql, since_s, limit=5000):
+    end = time.time()
+    start = end - since_s
+    url = LOKI + "/loki/api/v1/query_range?" + urllib.parse.urlencode(
+        {"query": logql, "limit": str(limit),
+         "start": str(int(start * 1e9)), "end": str(int(end * 1e9))}
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            data = json.load(r)["data"]["result"]
+    except urllib.error.URLError as e:
+        sys.exit(f"cannot reach Loki at {LOKI} — is the stack running?\n  docker compose up -d\n  ({e})")
+
+    # One record per log line, not per stream: identical-looking events share a
+    # stream, so taking stream labels alone silently drops repeats.
+    out = []
+    for st in data:
+        labels = st.get("stream", {})
+        for v in st.get("values", []):
+            rec = dict(labels)
+            rec["_ts"] = int(v[0])
+            if len(v) > 2 and isinstance(v[2], dict):
+                rec.update(v[2])
+            out.append(rec)
+    return out
+
+
+def in_order(evs):
+    """Chronological order.
+
+    event_sequence is Claude Code's own monotonic counter and is authoritative —
+    ingest timestamps can transpose events emitted in the same instant. Fall back
+    to ingest time only if any record lacks a sequence number.
+    """
+    return sorted(evs, key=lambda s: (s.get("event_timestamp", ""),
+                                      int(f(s, "event_sequence")),
+                                      s.get("_ts", 0)))
+
+
+def f(s, key, default=0):
+    try:
+        return float(s.get(key, default) or default)
+    except ValueError:
+        return default
+
+
+def i(s, key):
+    return int(f(s, key))
+
+
+def money(v):
+    return f"${v:,.4f}"
+
+
+def bar(frac, width=24):
+    n = int(round(frac * width))
+    return "█" * n + "·" * (width - n)
+
+
+def summary(reqs, label):
+    if not reqs:
+        print(f"no requests in {label}.")
+        print("(if you expected some: events take ~5s to export, and the stack must be running)")
+        return
+    total = sum(f(s, "cost_usd") for s in reqs)
+    out = sum(i(s, "output_tokens") for s in reqs)
+    inp = sum(i(s, "input_tokens") for s in reqs)
+    cread = sum(i(s, "cache_read_tokens") for s in reqs)
+    ccreate = sum(i(s, "cache_creation_tokens") for s in reqs)
+    durs = sorted(f(s, "duration_ms") for s in reqs)
+
+    print(f"\n  {label} — {len(reqs)} requests")
+    print(f"  {'─' * 58}")
+    print(f"  cost              {money(total)}")
+    print(f"  avg / request     {money(total / len(reqs))}")
+    print(f"  output tokens     {out:,}")
+    print(f"  cache read        {cread:,}")
+    print(f"  cache created     {ccreate:,}")
+    print(f"  fresh input       {inp:,}")
+    if cread + inp:
+        print(f"  cache hit rate    {cread / (cread + inp) * 100:.1f}%")
+    if durs:
+        p50 = durs[len(durs) // 2]
+        p95 = durs[min(len(durs) - 1, int(len(durs) * 0.95))]
+        print(f"  latency           p50 {p50 / 1000:.1f}s   p95 {p95 / 1000:.1f}s")
+
+    by = {}
+    for s in reqs:
+        d = by.setdefault(s.get("model", "?"), [0, 0.0])
+        d[0] += 1
+        d[1] += f(s, "cost_usd")
+    print(f"\n  by model")
+    for m, (n, c) in sorted(by.items(), key=lambda x: -x[1][1]):
+        share = c / total if total else 0
+        print(f"    {m:<28} {n:>4} req  {money(c):>11}  {bar(share)} {share * 100:>5.1f}%")
+
+
+def sess_label(r):
+    """Best human-readable name for a session."""
+    proj = r.get("project") or r.get("service_namespace")
+    if proj:
+        return proj[:20]
+    d = r.get("dir")
+    if d:
+        return ("…/" + d.rsplit("/", 1)[1])[:20]
+    bits = [b for b in (r.get("terminal_type"), r.get("app_entrypoint")) if b]
+    return ("/".join(bits) or "untagged")[:20]
+
+
+def sessions(reqs):
+    if not reqs:
+        print("no requests in range.")
+        return
+    agg = {}
+    for s in reqs:
+        d = agg.setdefault(s.get("session_id", "?"), {"n": 0, "c": 0.0, "o": 0, "t": "", "r": s})
+        d["n"] += 1
+        d["c"] += f(s, "cost_usd")
+        d["o"] += i(s, "output_tokens")
+        d["t"] = max(d["t"], s.get("event_timestamp", ""))
+    total = sum(d["c"] for d in agg.values())
+    untagged = sum(1 for d in agg.values() if not (d["r"].get("project") or d["r"].get("dir")))
+
+    print(f"\n  {len(agg)} sessions, {money(total)}")
+    print(f"  {'─' * 78}")
+    print(f"  {'id':<9} {'project':<20} {'req':>4} {'cost':>10} {'out':>8}  last seen")
+    print(f"  {'─' * 78}")
+    for sid, d in sorted(agg.items(), key=lambda x: -x[1]["c"]):
+        lab = sess_label(d["r"])
+        dim = "" if (d["r"].get("project") or d["r"].get("dir")) else DIM
+        print(f"  {dim}{sid[:8]:<9} {lab:<20} {d['n']:>4} {money(d['c']):>10} "
+              f"{d['o']:>8,}  {d['t'][11:19]}{RESET}")
+    print(f"  {'─' * 78}")
+    print(f"  {DIM}drill in:  ./usage-report -m --session <id-or-project>{RESET}")
+    if untagged:
+        print(f"  {DIM}{untagged} session(s) untagged — see ./tag-sessions.sh to name them"
+              f" by directory{RESET}")
+
+
+def group(reqs, key, title, name_fn=None):
+    if not reqs:
+        print("no requests in range.")
+        return
+    agg = {}
+    for s in reqs:
+        k = s.get(key, "?")
+        d = agg.setdefault(k, [0, 0.0, 0, ""])
+        d[0] += 1
+        d[1] += f(s, "cost_usd")
+        d[2] += i(s, "output_tokens")
+        d[3] = max(d[3], s.get("event_timestamp", ""))
+    total = sum(d[1] for d in agg.values())
+    print(f"\n  {title}  ({len(agg)} total, {money(total)})")
+    print(f"  {'─' * 66}")
+    for k, d in sorted(agg.items(), key=lambda x: -x[1][1]):
+        label = name_fn(k) if name_fn else k[:8]
+        share = d[1] / total if total else 0
+        print(f"  {label:<10} {d[0]:>4} req  {money(d[1]):>11}  {d[2]:>7,} out  {bar(share, 16)} {d[3][11:19]}")
+
+
+def top(reqs, n):
+    print(f"\n  most expensive requests")
+    print(f"  {'─' * 78}")
+    print(f"  {'cost':>10}  {'time':<9} {'model':<26} {'cacheCreate':>12} {'cacheRead':>11}  {'dur':>7}")
+    for s in sorted(reqs, key=lambda s: -f(s, "cost_usd"))[:n]:
+        print(f"  {money(f(s, 'cost_usd')):>10}  {s.get('event_timestamp','')[11:19]:<9} "
+              f"{s.get('model','?'):<26} {i(s,'cache_creation_tokens'):>12,} "
+              f"{i(s,'cache_read_tokens'):>11,}  {f(s,'duration_ms')/1000:>6.1f}s")
+
+
+def messages(since_s, want_session=None):
+    """Every message in one session, with what it cost."""
+    evs = query('{event_name=~"user_prompt|api_request"}', since_s)
+    if not evs:
+        print("no events in range — is the stack running, and has this session sent anything?")
+        return
+
+    if want_session:
+        w = want_session.lower()
+        sids = sorted({s.get("session_id", "") for s in evs
+                       if s.get("session_id", "").lower().startswith(w)
+                       or w in str(s.get("project", "")).lower()
+                       or w in str(s.get("dir", "")).lower()})
+        if not sids:
+            sys.exit(f"no session matching {want_session!r} in the last {int(since_s/3600)}h\n"
+                     f"(./usage-report --sessions to list them)")
+        if len(sids) > 1:
+            print(f"  {len(sids)} sessions match {want_session!r}; showing most recent")
+            sids = [max(sids, key=lambda x: max(
+                (s.get("event_timestamp", "") for s in evs if s.get("session_id") == x),
+                default=""))]
+        sid = sids[0]
+    else:
+        # most recently active session = the one you're in
+        sid = max(evs, key=lambda s: s.get("event_timestamp", "")).get("session_id", "")
+
+    evs = [s for s in evs if s.get("session_id") == sid]
+    prompts, calls = {}, {}
+    for s in evs:
+        pid = s.get("prompt_id")
+        if not pid:
+            continue
+        if s.get("event_name") == "user_prompt":
+            prompts[pid] = s
+        else:
+            calls.setdefault(pid, []).append(s)
+
+    rows = []
+    for pid, p in prompts.items():
+        cs = calls.get(pid, [])
+        rows.append((p.get("event_timestamp", ""), pid, p, cs))
+    # api_requests with no matching user_prompt (sub-agents, background work)
+    for pid, cs in calls.items():
+        if pid not in prompts:
+            rows.append((min(c.get("event_timestamp", "") for c in cs), pid, None, cs))
+    rows.sort()
+
+    total = sum(f(c, "cost_usd") for _, _, _, cs in rows for c in cs)
+    print(f"\n  session {sid[:8]}  —  {len(rows)} messages, {money(total)}")
+    print(f"  {'─' * 88}")
+    print(f"  {'time':<9} {'cost':>9} {'cum':>9} {'req':>4} {'out':>7}  message")
+    print(f"  {'─' * 88}")
+
+    cum = 0.0
+    for ts, pid, p, cs in rows:
+        cost = sum(f(c, "cost_usd") for c in cs)
+        cum += cost
+        out = sum(i(c, "output_tokens") for c in cs)
+        if p is None:
+            text = "\033[2m(background / subagent work)\033[0m"
+        else:
+            raw = str(p.get("prompt", ""))
+            if raw in ("<REDACTED>", "None", ""):
+                text = f"\033[2m<redacted, {p.get('prompt_length','?')} chars>\033[0m"
+            else:
+                text = raw.replace("\n", " ")[:46]
+        print(f"  {ts[11:19]:<9} {money(cost):>9} {money(cum):>9} {len(cs):>4} {out:>7,}  {text}")
+
+    print(f"  {'─' * 88}")
+    if rows:
+        dear = max(rows, key=lambda r: sum(f(c, "cost_usd") for c in r[3]))
+        print(f"  priciest message: {money(sum(f(c,'cost_usd') for c in dear[3]))} at {dear[0][11:19]}"
+              f"   →  ./usage-report --prompt {dear[1][:8]}")
+
+
+DIM, RESET, BOLD = "\033[2m", "\033[0m", "\033[1m"
+
+
+def tool_gist(s):
+    """A short human description of what a tool actually did, if details were logged."""
+    raw = s.get("tool_input") or s.get("tool_parameters") or ""
+    try:
+        d = json.loads(raw) if isinstance(raw, str) and raw.startswith("{") else {}
+    except json.JSONDecodeError:
+        d = {}
+    for k in ("full_command", "command", "file_path", "path", "pattern", "query", "url", "prompt"):
+        if d.get(k):
+            v = " ".join(str(d[k]).split())
+            if k in ("file_path", "path") and "/" in v:
+                v = ".../" + v.rsplit("/", 1)[1]
+            return v[:52]
+    if d.get("description"):
+        return str(d["description"])[:58]
+    n = i(s, "tool_input_size_bytes")
+    return f"{DIM}(details not logged, {n}B input){RESET}" if n else ""
+
+
+def timeline(pid, since_s):
+    evs = query('{service_name="claude-code"}', since_s)
+    if pid in ("last", "latest"):
+        cands = [s for s in evs if s.get("event_name") == "user_prompt" and s.get("prompt_id")]
+        if not cands:
+            sys.exit("no messages found in range")
+        pid = max(cands, key=lambda s: s.get("event_timestamp", ""))["prompt_id"]
+    evs = [s for s in evs if s.get("prompt_id", "").startswith(pid)]
+    if not evs:
+        sys.exit(f"no events for prompt_id starting {pid!r}\n"
+                 f"(try a longer --since, or ./usage-report -m to list messages)")
+    evs = in_order(evs)
+
+    calls = [s for s in evs if s.get("event_name") == "api_request"]
+    cost = sum(f(s, "cost_usd") for s in calls)
+    up = next((s for s in evs if s.get("event_name") == "user_prompt"), None)
+    tools = [s for s in evs if s.get("event_name") == "tool_result"]
+
+    text = ""
+    if up:
+        raw = str(up.get("prompt", ""))
+        text = (f'"{raw[:70]}"' if raw not in ("<REDACTED>", "None", "")
+                else f"{DIM}<redacted, {up.get('prompt_length','?')} chars>{RESET}")
+
+    stamps = [s.get("event_timestamp", "") for s in evs if s.get("event_timestamp")]
+    wall = ""
+    if len(stamps) > 1:
+        try:
+            a = time.strptime(min(stamps)[:19], "%Y-%m-%dT%H:%M:%S")
+            b = time.strptime(max(stamps)[:19], "%Y-%m-%dT%H:%M:%S")
+            wall = f", {time.mktime(b) - time.mktime(a):.0f}s wall"
+        except ValueError:
+            pass
+
+    print(f"\n  {BOLD}message {pid[:8]}{RESET}  —  {money(cost)} across {len(calls)} API "
+          f"call{'s' if len(calls) != 1 else ''}, {len(tools)} tool call"
+          f"{'s' if len(tools) != 1 else ''}{wall}")
+    if text:
+        print(f"  {text}")
+    print(f"  {'─' * 86}")
+
+    # Pair each decision with its result so a tool renders as one line.
+    results = {s.get("tool_use_id"): s for s in evs
+               if s.get("event_name") == "tool_result" and s.get("tool_use_id")}
+
+    step = 0
+    for s in evs:
+        n = s.get("event_name", "?")
+        t = s.get("event_timestamp", "")[11:19]
+        if n in ("user_prompt", "tool_result"):
+            continue
+        if n == "api_request":
+            step += 1
+            print(f"  {'─' * 86}")
+            print(f"  {BOLD}{step:>2}. {t}  API call{RESET}   {money(f(s,'cost_usd')):>9}   "
+                  f"{f(s,'duration_ms')/1000:>5.1f}s   out={i(s,'output_tokens'):<6,} "
+                  f"cacheRead={i(s,'cache_read_tokens'):,}")
+        elif n == "assistant_response":
+            print(f"      {t}  {DIM}response, {s.get('response_length','?')} chars{RESET}")
+        elif n == "tool_decision":
+            d = s.get("decision", "?")
+            res = results.get(s.get("tool_use_id"))
+            if res is None:
+                outcome = f"{DIM}(no result){RESET}"
+            elif res.get("success") == "true":
+                outcome = f"{DIM}{f(res,'duration_ms')/1000:.1f}s → {i(res,'tool_result_size_bytes'):,}B{RESET}"
+            else:
+                outcome = f"\033[31mFAILED\033[0m {DIM}{f(res,'duration_ms')/1000:.1f}s{RESET}"
+            mark = "✓" if d == "accept" else "✗"
+            gist = tool_gist(res) if res is not None and tool_gist(res) else tool_gist(s)
+            print(f"      {t}  {mark} {s.get('tool_name','?'):<10} {outcome:<34} {gist}")
+        elif n in ("api_error", "api_refusal", "internal_error"):
+            print(f"      {t}  \033[31m{n}{RESET}")
+
+    print(f"  {'─' * 86}")
+    if calls:
+        print(f"  {'':>4}{'cost':>10}{'out tok':>10}{'cacheRead':>12}{'cacheCreate':>13}{'dur':>8}")
+        for k, c in enumerate(calls, 1):
+            print(f"  {k:>2}. {money(f(c,'cost_usd')):>9}{i(c,'output_tokens'):>10,}"
+                  f"{i(c,'cache_read_tokens'):>12,}{i(c,'cache_creation_tokens'):>13,}"
+                  f"{f(c,'duration_ms')/1000:>7.1f}s")
+        print(f"  {'':>4}{money(cost):>9}{sum(i(c,'output_tokens') for c in calls):>10,}")
+        if len(calls) > 1:
+            print(f"\n  {DIM}cost is roughly flat per call — each one re-reads the whole "
+                  f"conversation.{RESET}")
+            print(f"  {DIM}more tool calls ⇒ more API calls ⇒ more cost.{RESET}")
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--since", default="24h")
+    p.add_argument("--sessions", action="store_true")
+    p.add_argument("--prompts", action="store_true")
+    p.add_argument("--top", type=int, metavar="N")
+    p.add_argument("--prompt", metavar="ID")
+    p.add_argument("-m", "--messages", action="store_true")
+    p.add_argument("--session", metavar="ID")
+    p.add_argument("--watch", action="store_true")
+    p.add_argument("-h", "--help", action="store_true")
+    a = p.parse_args()
+
+    if a.help:
+        print(__doc__)
+        return
+
+    since_s = parse_since(a.since)
+
+    if a.prompt:
+        timeline(a.prompt, max(since_s, 86400))
+        return
+
+    if a.messages or a.session:
+        messages(since_s, a.session)
+        print()
+        return
+
+    def fetch():
+        return query('{event_name="api_request"}', since_s)
+
+    if a.watch:
+        try:
+            while True:
+                print("\033[2J\033[H", end="")
+                summary(fetch(), f"last {a.since}  ({time.strftime('%H:%M:%S')})")
+                print("\n  ctrl-c to stop")
+                time.sleep(10)
+        except KeyboardInterrupt:
+            return
+
+    reqs = fetch()
+    if a.sessions:
+        sessions(reqs)
+    elif a.prompts:
+        group(reqs, "prompt_id", "cost by prompt (one thing you typed)")
+    elif a.top:
+        top(reqs, a.top)
+    else:
+        summary(reqs, f"last {a.since}")
+    print()
+
+
+if __name__ == "__main__":
+    main()

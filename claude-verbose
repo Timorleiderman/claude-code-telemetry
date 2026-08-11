@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+#
+# Launch Claude Code with content logging enabled FOR THIS SESSION ONLY.
+#
+# Your ~/.claude/settings.json stays untouched — these variables live and die
+# with the process this script starts. Every other Claude Code session keeps
+# recording metadata only.
+#
+#   ./claude-verbose              prompts + responses
+#   ./claude-verbose --tools      + tool parameters (bash commands, file paths)
+#   ./claude-verbose --full       + tool output and raw API bodies
+#
+# Anything after the level flag is passed through to claude:
+#   ./claude-verbose --tools -p "explain this repo"
+#
+set -euo pipefail
+
+LEVEL="basic"
+case "${1:-}" in
+  --tools) LEVEL="tools"; shift ;;
+  --full)  LEVEL="full";  shift ;;
+  --help|-h)
+    sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+esac
+
+# Fall back to the local stack if settings.json hasn't set these.
+export CLAUDE_CODE_ENABLE_TELEMETRY="${CLAUDE_CODE_ENABLE_TELEMETRY:-1}"
+export OTEL_METRICS_EXPORTER="${OTEL_METRICS_EXPORTER:-otlp}"
+export OTEL_LOGS_EXPORTER="${OTEL_LOGS_EXPORTER:-otlp}"
+export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}"
+export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
+
+# Always on for a verbose session.
+export OTEL_LOG_USER_PROMPTS=1
+export OTEL_LOG_ASSISTANT_RESPONSES=1
+
+case "$LEVEL" in
+  tools)
+    export OTEL_LOG_TOOL_DETAILS=1
+    ;;
+  full)
+    export OTEL_LOG_TOOL_DETAILS=1
+    export OTEL_LOG_TOOL_CONTENT=1
+    export OTEL_LOG_RAW_API_BODIES=1
+    ;;
+esac
+
+# Tag the session so you can find and delete it later.
+export OTEL_RESOURCE_ATTRIBUTES="${OTEL_RESOURCE_ATTRIBUTES:+${OTEL_RESOURCE_ATTRIBUTES},}content_logging=${LEVEL}"
+
+warn() { printf '\033[33m%s\033[0m\n' "$1" >&2; }
+
+warn "┌─ content logging: ${LEVEL} ─────────────────────────────────"
+warn "│ Prompts and responses will be stored in Loki as plaintext."
+case "$LEVEL" in
+  tools) warn "│ PLUS tool parameters — bash commands and file paths." ;;
+  full)  warn "│ PLUS tool output and full API bodies — this includes"
+         warn "│ FILE CONTENTS. Do not use in a repo holding secrets." ;;
+esac
+warn "│ Retained 90 days. Grafana has no login."
+warn "│ This session only — other sessions are unaffected."
+warn "└────────────────────────────────────────────────────────────"
+
+exec claude "$@"

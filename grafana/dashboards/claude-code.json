@@ -1,0 +1,341 @@
+{
+  "uid": "claude-code-usage",
+  "title": "Claude Code — Usage & Cost",
+  "tags": ["claude-code", "otel"],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(claude_code_token_usage_tokens_total, model)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Totals (from Prometheus metrics)",
+      "id": 100,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Cost",
+      "id": 1,
+      "description": "Sum of each session's cumulative counter. max_over_time is deliberate — see the Notes row at the bottom.",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "decimals": 4, "color": { "mode": "fixed", "fixedColor": "text" } },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(max_over_time(claude_code_cost_usage_USD_total{model=~\"$model\"}[$__range]))",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Tokens",
+      "id": 2,
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "text" } },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(max_over_time(claude_code_token_usage_tokens_total{model=~\"$model\"}[$__range]))",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Sessions",
+      "id": 3,
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "text" } },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(max_over_time(claude_code_session_count_total[$__range]))",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Active time",
+      "id": 4,
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "text" } },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(max_over_time(claude_code_active_time_seconds_total[$__range]))",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Tokens by type",
+      "id": 5,
+      "description": "A high cacheRead share is good — cache reads are much cheaper than fresh input tokens.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "values": false },
+        "legend": { "showLegend": false }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (type) (max_over_time(claude_code_token_usage_tokens_total{model=~\"$model\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "type": "piechart",
+      "title": "Cost by model",
+      "id": 6,
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value"] },
+        "reduceOptions": { "calcs": ["lastNotNull"], "values": false }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model) (max_over_time(claude_code_cost_usage_USD_total[$__range]))",
+          "instant": true,
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Sessions by terminal",
+      "id": 7,
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "values": false },
+        "legend": { "showLegend": false }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (terminal_type) (max_over_time(claude_code_session_count_total[$__range]))",
+          "instant": true,
+          "legendFormat": "{{terminal_type}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Over time (from Loki events — exact per-request data)",
+      "id": 101,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Cost per interval, by model",
+      "id": 8,
+      "description": "Derived from api_request events, so every request is counted exactly once.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "custom": { "fillOpacity": 20, "lineWidth": 2, "showPoints": "auto", "stacking": { "mode": "normal" } }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum by (model) (sum_over_time({service_name=\"claude-code\", event_name=\"api_request\"} | unwrap cost_usd [$__interval]))",
+          "queryType": "range",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "API latency p50 / p95 (ms)",
+      "id": 9,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "auto" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "quantile_over_time(0.95, {service_name=\"claude-code\", event_name=\"api_request\"} | unwrap duration_ms [$__interval]) by (model)",
+          "queryType": "range",
+          "legendFormat": "p95 {{model}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "quantile_over_time(0.50, {service_name=\"claude-code\", event_name=\"api_request\"} | unwrap duration_ms [$__interval]) by (model)",
+          "queryType": "range",
+          "legendFormat": "p50 {{model}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests per interval",
+      "id": 10,
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 20, "lineWidth": 1, "drawStyle": "bars", "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum by (model) (count_over_time({service_name=\"claude-code\", event_name=\"api_request\"}[$__interval]))",
+          "queryType": "range",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Output tokens per interval",
+      "id": 11,
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 20, "lineWidth": 2, "showPoints": "auto" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum(sum_over_time({service_name=\"claude-code\", event_name=\"api_request\"} | unwrap output_tokens [$__interval]))",
+          "queryType": "range",
+          "legendFormat": "output tokens"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Raw events",
+      "id": 102,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 28 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "logs",
+      "title": "API requests — click a line to expand cost, tokens, latency, IDs",
+      "id": 12,
+      "gridPos": { "h": 11, "w": 24, "x": 0, "y": 29 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "{service_name=\"claude-code\", event_name=\"api_request\"}",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "title": "Notes",
+      "id": 13,
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 40 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Why `max_over_time` and not `increase`?** Each Claude Code session emits its own counter series, which appears *already at its final value* and then expires a few minutes after the session ends. `increase()` treats that first sample as its baseline and reports **0**. Summing each series' max gives the true total.\n\n**Why are the time-series panels on Loki?** Metrics have the same first-sample problem over short windows. The `api_request` events carry exact per-request `cost_usd`, `duration_ms` and token counts, so aggregating those is precise.\n\nFull explanation: <http://localhost:8000/queries/>"
+      }
+    }
+  ]
+}
