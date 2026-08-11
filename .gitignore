@@ -7,3 +7,7 @@ docker-compose.override.yml
 .env
 
 .DS_Store
+
+# python bytecode (from importing usage-report in tests)
+__pycache__/
+*.pyc
