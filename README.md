@@ -24,15 +24,16 @@ which prompts, or which habits are responsible. This does.
 $ ./usage-report -m
 
   session 5e551011  —  9 messages, $5.8476
-  ──────────────────────────────────────────────────────────────────────
-  time           cost       cum  req     out  message
-  ──────────────────────────────────────────────────────────────────────
-  21:20:01    $1.2379   $1.2379    3   3,868  <redacted, 61 chars>
-  21:31:37    $1.1243   $3.5525   11   9,179  <redacted, 62 chars>
-  21:39:05    $0.4290   $4.3659    4   3,212  fix the failing auth test
-  21:45:27    $0.3676   $5.8476    3   3,252  make the CLI output easier to scan
-  ──────────────────────────────────────────────────────────────────────
-  priciest message: $1.2379 at 21:20:01   →  ./usage-report --prompt 9r0m9703
+  ────────────────────────────────────────────────────────────────────────────
+  time      id             cost       cum  req     out  message
+  ────────────────────────────────────────────────────────────────────────────
+  21:20:01  9r0m9703    $1.2379   $1.2379    3   3,868  <redacted, 61 chars>
+  21:31:37  9r0m9705    $1.1243   $3.5525   11   9,179  <redacted, 62 chars>
+  21:39:05  9r0m9707    $0.4290   $4.3659    4   3,212  fix the failing auth test
+  21:45:27  9r0m9709    $0.3676   $5.8476    3   3,252  make the CLI output easier to scan
+  ────────────────────────────────────────────────────────────────────────────
+  priciest: $1.2379 at 21:20:01
+  drill into any row:  ./usage-report --prompt <id>   (e.g. 9r0m9703)
 ```
 
 One message is not one API call — the `req` column is the fan-out from tool loops and retries.

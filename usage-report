@@ -255,9 +255,9 @@ def messages(since_s, want_session=None):
 
     total = sum(f(c, "cost_usd") for _, _, _, cs in rows for c in cs)
     print(f"\n  session {sid[:8]}  —  {len(rows)} messages, {money(total)}")
-    print(f"  {'─' * 88}")
-    print(f"  {'time':<9} {'cost':>9} {'cum':>9} {'req':>4} {'out':>7}  message")
-    print(f"  {'─' * 88}")
+    print(f"  {'─' * 96}")
+    print(f"  {'time':<9} {'id':<9} {'cost':>9} {'cum':>9} {'req':>4} {'out':>7}  message")
+    print(f"  {'─' * 96}")
 
     cum = 0.0
     for ts, pid, p, cs in rows:
@@ -272,13 +272,15 @@ def messages(since_s, want_session=None):
                 text = f"\033[2m<redacted, {p.get('prompt_length','?')} chars>\033[0m"
             else:
                 text = raw.replace("\n", " ")[:46]
-        print(f"  {ts[11:19]:<9} {money(cost):>9} {money(cum):>9} {len(cs):>4} {out:>7,}  {text}")
+        print(f"  {ts[11:19]:<9} {DIM}{pid[:8]}{RESET}  {money(cost):>9} {money(cum):>9} "
+              f"{len(cs):>4} {out:>7,}  {text}")
 
-    print(f"  {'─' * 88}")
+    print(f"  {'─' * 96}")
     if rows:
         dear = max(rows, key=lambda r: sum(f(c, "cost_usd") for c in r[3]))
-        print(f"  priciest message: {money(sum(f(c,'cost_usd') for c in dear[3]))} at {dear[0][11:19]}"
-              f"   →  ./usage-report --prompt {dear[1][:8]}")
+        print(f"  priciest: {money(sum(f(c,'cost_usd') for c in dear[3]))} at {dear[0][11:19]}")
+        print(f"  {DIM}drill into any row:  ./usage-report --prompt <id>"
+              f"   (e.g. {dear[1][:8]}){RESET}")
 
 
 DIM, RESET, BOLD = "\033[2m", "\033[0m", "\033[1m"
